@@ -1,0 +1,450 @@
+#include <ros/ros.h>
+#include <pcl/ros/conversions.h>
+#include <pcl_ros/transforms.h>
+#include <pcl/point_cloud.h>
+#include <sensor_msgs/PointCloud2.h>
+#include "pcl/io/pcd_io.h"
+#include "pcl/point_types.h"
+#include <sensor_msgs/point_cloud_conversion.h>
+
+#include <tf/transform_listener.h>
+
+#include <actionlib/client/simple_action_client.h>
+#include <tabletop_object_detector/TabletopDetection.h>
+#include <tabletop_collision_map_processing/TabletopCollisionMapProcessing.h>
+#include <object_manipulation_msgs/PickupAction.h>
+#include <object_manipulation_msgs/PlaceAction.h>
+#include <tabletop_object_detector/TabletopObjectRecognition.h>
+#include "duplo_notouch_onebin/Grasp_Duplo.h"
+#include "duplo_notouch_onebin/Get_New_PCD.h"
+
+#include <pr2_controllers_msgs/Pr2GripperCommandAction.h>
+#include <pr2_controllers_msgs/PointHeadAction.h>
+
+typedef actionlib::SimpleActionClient<pr2_controllers_msgs::Pr2GripperCommandAction> GripperClient;
+typedef actionlib::SimpleActionClient<pr2_controllers_msgs::PointHeadAction> PointHeadClient;
+
+class RobotHead
+{
+	private:
+		PointHeadClient* point_head_client_;
+
+	public:
+		//! Action client initialization 
+		RobotHead()
+	{
+		//Initialize the client for the Action interface to the head controller
+		point_head_client_ = new PointHeadClient("/head_traj_controller/point_head_action", true);
+
+		//wait for head controller action server to come up 
+		while(!point_head_client_->waitForServer(ros::Duration(5.0))){
+			ROS_INFO("Waiting for the point_head_action server to come up");
+		}
+	}
+
+		~RobotHead()
+	{
+		delete point_head_client_;
+	}
+
+		//! Points the high-def camera frame at a point in a given frame  
+		void lookAt(std::string frame_id, double x, double y, double z)
+	{
+		//the goal message we will be sending
+		pr2_controllers_msgs::PointHeadGoal goal;
+
+		//the target point, expressed in the requested frame
+		geometry_msgs::PointStamped point;
+		point.header.frame_id = frame_id;
+		point.point.x = x; point.point.y = y; point.point.z = z;
+		goal.target = point;
+
+		//we are pointing the high-def camera frame 
+		//(pointing_axis defaults to X-axis)
+		goal.pointing_frame = "high_def_frame";
+
+		//take at least 0.5 seconds to get there
+		goal.min_duration = ros::Duration(0.5);
+
+		//and go no faster than 1 rad/s
+		goal.max_velocity = 1.0;
+
+		//send the goal
+		point_head_client_->sendGoal(goal);
+
+		//wait for it to get there (abort after 2 secs to prevent getting stuck)
+		point_head_client_->waitForResult(ros::Duration(2));
+	}
+
+};
+
+class Gripper{
+	private:
+		GripperClient* gripper_client_;  
+
+	public:
+		//Action client initialization
+		Gripper(){
+
+			//Initialize the client for the Action interface to the gripper controller
+			//and tell the action client that we want to spin a thread by default
+			gripper_client_ = new GripperClient("r_gripper_controller/gripper_action", true);
+
+			//wait for the gripper action server to come up 
+			while(!gripper_client_->waitForServer(ros::Duration(5.0))){
+				ROS_INFO("Waiting for the r_gripper_controller/gripper_action action server to come up");
+			}
+		}
+
+		~Gripper(){
+			delete gripper_client_;
+		}
+
+		//Open the gripper
+		bool open(){
+			pr2_controllers_msgs::Pr2GripperCommandGoal open;
+			open.command.position = 0.08;
+			open.command.max_effort = -1.0;  // Do not limit effort (negative)
+
+			ROS_INFO("Sending open goal");
+			gripper_client_->sendGoal(open);
+			gripper_client_->waitForResult();
+			if(gripper_client_->getState() == actionlib::SimpleClientGoalState::SUCCEEDED) {
+				ROS_INFO("The gripper opened!");
+				return true;
+			}
+			else {
+				ROS_INFO("The gripper failed to open.");
+				return false;
+			}
+		}
+};
+
+sensor_msgs::PointCloud2 to_pick;
+bool start_manipulation = false;
+
+int move_arm(geometry_msgs::Point go_to);
+
+void manipulate(const sensor_msgs::PointCloud2::ConstPtr& pcd)
+{   
+	ROS_INFO(" Setting the flag to start manipulation.");
+	to_pick = *pcd;
+	start_manipulation = true;
+}
+
+int main(int argc, char **argv)
+{
+	//initialize the ROS node
+	ros::init(argc, argv, "manipulator");
+	ros::NodeHandle nh;
+
+	ROS_INFO("Waiting to receive a point cloud to manipulate\n");
+
+	bool pickup_success;
+	bool model_fit;
+	int model_id;
+	Gripper gripper;
+    geometry_msgs::Point reset_posn;
+	reset_posn.x = 0.6;	reset_posn.y = -0.5; reset_posn.z = 0;
+	geometry_msgs::Point red;
+	red.x = 0.55;  red.y = -0.5; red.z = 0;  //Red bin
+	geometry_msgs::Point blue;
+	blue.x = 0.5;  blue.y = -0.5; blue.z = 0;	//Blue bin
+	geometry_msgs::Point green;
+	green.x = 0.45; green.y = -0.5; green.z = 0;  //Green bin
+	
+//	const geometry_msgs::Point yellow = {0.45, -0.5, 0};  //Yellow bin
+//	const geometry_msgs::Point orange = {0.35, -0.5, 0};  //Orange bin
+
+	int red_color = 0xff0000; 
+	const float RGB_RED = *reinterpret_cast<float*>(&red_color);
+	int blue_color = 0xff; 
+	const float RGB_BLUE = *reinterpret_cast<float*>(&blue_color);
+	int green_color = 0xff00; 
+	const float RGB_GREEN = *reinterpret_cast<float*>(&green_color);
+	
+	ros::Subscriber sub = nh.subscribe("pick_place",1,manipulate);
+	ros::ServiceClient client_newpcd = 
+		nh.serviceClient<duplo_notouch_onebin::Get_New_PCD>("get_new_pcd");
+    duplo_notouch_onebin::Get_New_PCD srv_newpcd;
+
+	//set service and action names
+	const std::string OBJECT_DETECTION_SERVICE_NAME = "/object_detection";
+	const std::string COLLISION_PROCESSING_SERVICE_NAME = 
+		"/tabletop_collision_map_processing/tabletop_collision_map_processing";
+	const std::string PICKUP_ACTION_NAME = 
+		"/object_manipulator/object_manipulator_pickup";
+	//const std::string PLACE_ACTION_NAME = 
+	//	"/object_manipulator/object_manipulator_place";
+	const std::string MODEL_FITTING_SERVICE_NAME = 
+		"/object_recognition";
+
+	//create service and action clients
+	ros::ServiceClient object_detection_srv;
+	ros::ServiceClient collision_processing_srv;
+	actionlib::SimpleActionClient<object_manipulation_msgs::PickupAction> 
+		pickup_client(PICKUP_ACTION_NAME, true);
+	//	actionlib::SimpleActionClient<object_manipulation_msgs::PlaceAction> 
+	//		place_client(PLACE_ACTION_NAME, true);
+	ros::ServiceClient model_fitting_srv;
+
+	//wait for detection client
+	while ( !ros::service::waitForService(OBJECT_DETECTION_SERVICE_NAME, 
+	                                      ros::Duration(2.0)) && nh.ok() ) 
+	{
+		ROS_INFO("Waiting for object detection service to come up");
+	}
+	if (!nh.ok()) exit(0);
+	object_detection_srv = 
+		nh.serviceClient<tabletop_object_detector::TabletopDetection>
+		(OBJECT_DETECTION_SERVICE_NAME, true);
+
+	//wait for collision map processing client
+	while ( !ros::service::waitForService(COLLISION_PROCESSING_SERVICE_NAME, 
+	                                      ros::Duration(2.0)) && nh.ok() ) 
+	{
+		ROS_INFO("Waiting for collision processing service to come up");
+	}
+	if (!nh.ok()) exit(0);
+	collision_processing_srv = 
+		nh.serviceClient
+		<tabletop_collision_map_processing::TabletopCollisionMapProcessing>
+		(COLLISION_PROCESSING_SERVICE_NAME, true);
+
+	//wait for pickup client
+	while(!pickup_client.waitForServer(ros::Duration(2.0)) && nh.ok())
+	{
+		ROS_INFO_STREAM("Waiting for action client " << PICKUP_ACTION_NAME);
+	}
+	if (!nh.ok()) exit(0);  
+
+	//wait for place client
+	/*	while(!place_client.waitForServer(ros::Duration(2.0)) && nh.ok())
+	{
+		ROS_INFO_STREAM("Waiting for action client " << PLACE_ACTION_NAME);
+ 	}
+	if (!nh.ok()) exit(0);    
+	*/
+
+	while ( !ros::service::waitForService(MODEL_FITTING_SERVICE_NAME, 
+	                                      ros::Duration(2.0)) && nh.ok() ) 
+	{
+		ROS_INFO("Waiting for model fitting service to come up");
+	}
+	if (!nh.ok()) exit(0);
+	model_fitting_srv = nh.serviceClient<tabletop_object_detector::TabletopObjectRecognition>
+		(MODEL_FITTING_SERVICE_NAME, true);
+
+	while (ros::ok() && start_manipulation == false) {
+		ros::spinOnce();
+		if (start_manipulation==true) {
+			start_manipulation = false;
+
+			//call the tabletop detection
+			ROS_INFO("Calling tabletop detector");
+			tabletop_object_detector::TabletopDetection detection_call;
+			//we want recognized database objects returned
+			//set this to false if you are using the pipeline without the database
+			detection_call.request.return_clusters = true;
+			//we want the individual object point clouds returned as well
+			detection_call.request.return_models = false;
+			if (!object_detection_srv.call(detection_call))
+			{
+				ROS_ERROR("Tabletop detection service failed");
+				return false;
+			}
+			if (detection_call.response.detection.result != 
+			    detection_call.response.detection.SUCCESS)
+			{
+				ROS_ERROR("Tabletop detection returned error code %d", 
+				          detection_call.response.detection.result);
+				return false;
+			}
+			if (detection_call.response.detection.clusters.empty() && 
+			    detection_call.response.detection.models.empty() )
+			{
+				ROS_DEBUG("The tabletop detector detected the table, but found no objects");
+				//return false;
+			}
+			detection_call.response.detection.clusters.clear();
+
+			//call collision map processing
+			ROS_INFO("Calling collision map processing");
+			tabletop_collision_map_processing::TabletopCollisionMapProcessing 
+				processing_call;
+			//pass the result of the tabletop detection 
+			processing_call.request.detection_result = detection_call.response.detection;
+			//ask for the exising map and collision models to be reset
+			processing_call.request.reset_static_map = true;
+			processing_call.request.reset_collision_models = true;
+			processing_call.request.reset_attached_models = true;
+			//ask for a new static collision map to be taken with the laser
+			//after the new models are added to the environment
+			processing_call.request.take_static_collision_map = false;
+			//ask for the results to be returned in base link frame
+			processing_call.request.desired_frame = "base_link";
+			if (!collision_processing_srv.call(processing_call))
+			{
+				ROS_ERROR("Collision map processing service failed");
+				return false;
+			}
+			//the collision map processor returns instances of graspable objects
+			if (processing_call.response.graspable_objects.empty())
+			{
+				ROS_DEBUG("Collision map processing returned no graspable objects");
+				//return false;
+			}
+
+			//call object pickup
+			ROS_INFO("Calling the pickup action");
+			object_manipulation_msgs::PickupGoal pickup_goal;
+
+			//pass one of the graspable objects returned by the collission map processor
+
+			/*********************************************************************/
+			/*********************************************************************/
+			/********** Changed *********/
+			//pickup_goal.target = processing_call.response.graspable_objects.at(0);
+
+			object_manipulation_msgs::GraspableObject object;
+			//object.reference_frame_id = "/openni_rgb_frame";
+			sensor_msgs::PointCloud goal_pcd;
+			sensor_msgs::PointCloud2 pick_cluster;
+			/*toROSMsg(to_pick,pick_cluster);
+
+			tf::TransformListener listener;
+			sensor_msgs::PointCloud2 transformed;
+			pick_cluster.header.frame_id = "openni_rgb_optical_frame";
+			listener.waitForTransform("openni_rgb_optical_frame","base_link",
+			                          pick_cluster.header.stamp,ros::Duration(2.0));
+			pcl_ros::transformPointCloud("base_link",pick_cluster,transformed,listener);
+*/
+			if (sensor_msgs::convertPointCloud2ToPointCloud(to_pick,goal_pcd) == true)
+			{
+				ROS_INFO("Frame Id of input point cloud cluster is: %s\n", goal_pcd.header.frame_id.c_str());
+				ROS_INFO("Target frame id is: %s\n", detection_call.response.detection.table.pose.header.frame_id.c_str());
+				goal_pcd.header.frame_id = "base_link";
+				goal_pcd.header.stamp = ros::Time::now();
+
+				object.cluster = goal_pcd;
+				object.reference_frame_id = "base_link";
+				pickup_goal.target = object;
+				ROS_INFO("Set the goal target as a graspable object\n");
+
+			} else {
+				ROS_ERROR("Conversion from pointcloud2 to pointcloud failed.\n");
+				return false;
+			}
+
+			/**** Fitting a model to goal_pcd ****/
+			tabletop_object_detector::TabletopObjectRecognition fitting_call;
+			fitting_call.request.clusters.push_back(goal_pcd);
+			fitting_call.request.num_models = 1;
+			fitting_call.request.perform_fit_merge = false;
+
+			if (!model_fitting_srv.call(fitting_call))
+			{
+				ROS_ERROR("Model fitting service failed");
+				model_fit = false;
+				//return false;
+			} else {
+				model_fit = true;
+				model_id = fitting_call.response.cluster_model_indices[0];
+			}
+
+			//pass the name that the object has in the collision environment
+			//this name was also returned by the collision map processor
+			//pickup_goal.collision_object_name = 
+			//  processing_call.response.collision_object_names.at(0);
+			/*********************************************************************/
+			/*********************************************************************/
+
+			//pass the collision name of the table, also returned by the collision 
+			//map processor
+			pickup_goal.collision_support_surface_name = 
+				processing_call.response.collision_support_surface_name;
+
+			/*********************************************************************/
+			/*********************************************************************/
+			/******* Added: allowing collisions with the table ******/
+			pickup_goal.allow_gripper_support_collision = true;
+			/*********************************************************************/
+			/*********************************************************************/
+
+			//pick up the object with the right arm
+			pickup_goal.arm_name = "right_arm";
+			//specify the desired distance between pre-grasp and final grasp
+			pickup_goal.desired_approach_distance = 0.1;
+			pickup_goal.min_approach_distance = 0.05;
+			//we will be lifting the object along the "vertical" direction
+			//which is along the z axis in the base_link frame
+			geometry_msgs::Vector3Stamped direction;
+			direction.header.stamp = ros::Time::now();
+			direction.header.frame_id = "base_link";
+			direction.vector.x = 0;
+			direction.vector.y = 0;
+			direction.vector.z = 1;
+			pickup_goal.lift.direction = direction;
+			//request a vertical lift of 10cm after grasping the object
+			pickup_goal.lift.desired_distance = 0.15;
+			pickup_goal.lift.min_distance = 0.1;
+			//do not use tactile-based grasping or tactile-based lift
+			pickup_goal.use_reactive_lift = false;
+			pickup_goal.use_reactive_execution = false;
+
+			//send the goal
+			pickup_client.sendGoal(pickup_goal);
+			while (!pickup_client.waitForResult(ros::Duration(10.0)))
+			{
+				ROS_INFO("Waiting for the pickup action...");
+			}
+			object_manipulation_msgs::PickupResult pickup_result = 
+				*(pickup_client.getResult());
+			if (pickup_client.getState() != actionlib::SimpleClientGoalState::SUCCEEDED)
+			{
+				ROS_ERROR("The pickup action has failed with result code %d", 
+				          pickup_result.manipulation_result.value);
+				pickup_success = false;
+				//return false;
+			} 
+			else 
+			{
+				ROS_INFO("The pickup action succeeded.");   
+				pickup_success= true;
+			}
+			if (pickup_success) {
+				pcl::PointCloud<pcl::PointXYZRGB> temp;
+				fromROSMsg(to_pick,temp);
+				if (abs(temp.points[0].rgb - RGB_RED) < 0.05e-38)
+					move_arm(red);
+				else if (abs(temp.points[0].rgb - RGB_BLUE) < 0.05e-38)
+					move_arm(blue);
+				else if (abs(temp.points[0].rgb - RGB_GREEN) < 0.05e-38)
+					move_arm(green);
+/*				else if (abs(temp.points[0].rgb - ( )) < 0.05e-38)
+					move_arm(yellow);
+				else if (abs(temp.points[0].rgb - ( )) < 0.05e-38)
+					move_arm(orange);
+*/				else
+					move_arm(reset_posn);
+				gripper.open();
+			} else {
+				move_arm(reset_posn);
+			}
+			RobotHead head;
+			head.lookAt("base_link", 0.2, 0.0, 1.0);
+			
+			// Ask for new PCD
+			srv_newpcd.request.question = true;
+
+			if (client_newpcd.call(srv_newpcd)) {
+				ROS_INFO("Requesting for new point cloud.");
+			} else {
+				ROS_ERROR("Failed to call service get new pcd.");
+				return 1;
+	  		}
+		}
+		//ros::spin();
+	}
+	return 0;
+}

@@ -1,0 +1,71 @@
+/*
+ *  process_data.h
+ *  
+ *
+ *  Created by Megha Gupta on 12/19/11.
+ *  Copyright 2011 USC. All rights reserved.
+ *
+ */
+
+#ifndef PROCESS_DATA_H
+#define PROCESS_DATA_H
+
+#include <string.h>
+
+#include <ros/ros.h>
+#include <sensor_msgs/PointCloud2.h>
+
+// PCL specific includes
+#include <pcl/ros/conversions.h>
+#include <pcl/point_cloud.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+//#include <pcl/tree_types.hpp>
+
+#include "pass_through_gen.h"
+#include "find_extents.h"
+#include "planar_seg.h"
+#include "extract_color_clusters.h"
+//#include "duplo_v0/cluster.h"
+
+#include "duplo_v0/Process_PCD.h"
+#include "duplo_v0/Grasp_Duplo.h"
+#include "duplo_v0/Get_New_PCD.h"
+
+using namespace pcl;
+
+namespace sort_duplos {
+	class DataProcessor 
+	{
+	public:
+		DataProcessor (ros::NodeHandle & n);
+		~DataProcessor (void);
+		
+	private:
+		//Functions
+		bool processDataCallback(duplo_v0::Process_PCD::Request &req,
+								 duplo_v0::Process_PCD::Response &res);
+		void preprocess (void);
+		int cluster (void);
+		bool callGraspingService (void);
+		bool callNewDataService (void);
+		
+		//Variables
+		ros::NodeHandle n_;
+		//ros::Publisher rvizMarkerPub_;
+		ros::ServiceServer processDataServer_;
+		ros::ServiceClient graspDuploClient_;
+		ros::ServiceClient getNewDataClient_;
+		ros::Publisher planarCloudPub_;
+		ros::Publisher objectCloudPub_;
+		
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr input_;
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr planarCloud_;
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr objectCloud_;
+		sensor_msgs::PointCloud2 theChosenOne_;
+		int noClusterCount_;
+		
+	};
+}
+
+#endif

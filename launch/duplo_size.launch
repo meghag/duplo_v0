@@ -1,0 +1,15 @@
+<launch>
+
+	<!-- Kill grasp planner started by pr2_tabletop_manipulation -->
+	<node name="pr2_gripper_grasp_planner_cluster" pkg="pr2_gripper_grasp_planner_cluster" 
+    type="pr2_gripper_grasp_planner_cluster_server.py" respawn="false" output="screen">
+	<param name="z_up_frame" value="/base_link"/>
+	</node> 
+	
+	<!-- Start Duplo sorting nodes -->
+	<node name="process_data" pkg="duplo_v0" type="process_data" respawn="false" output="screen" />
+	<node name="grasp_duplo_server" pkg="duplo_v0" type="grasp_duplo" respawn="false" output="screen" />
+	<!-- <node name="manipulator" pkg="duplo_v0" type="pick_place_size" respawn="false" output="screen" /> -->
+	<node name="pcd_from_kinect" pkg="duplo_v0" type="read_pcd" output="screen"/>
+	
+</launch>

@@ -1,0 +1,178 @@
+#include "process_data.h"
+
+namespace sort_duplos {
+	DataProcessor::DataProcessor (ros::NodeHandle & n): n_(n)
+	{
+		processDataServer_ = n_.advertiseService("process_pcd", &DataProcessor::processDataCallback, this);
+		ROS_INFO("Ready to process input point cloud data.");
+		
+		graspDuploClient_ = n_.serviceClient<duplo_v0::Grasp_Duplo>("grasp_duplo");
+		
+		getNewDataClient_ = n_.serviceClient<duplo_v0::Get_New_PCD>("get_new_pcd");
+
+		planarCloudPub_ = n_.advertise<sensor_msgs::PointCloud2>("table_point_cloud",1);
+		objectCloudPub_ = n_.advertise<sensor_msgs::PointCloud2>("object_point_cloud",1);
+		
+		noClusterCount_ = 0;
+	}		
+	
+	DataProcessor::~DataProcessor (void)
+	{
+		if (input_ != NULL)
+			input_.reset();
+		if (planarCloud_ != NULL)
+			planarCloud_.reset();
+		if (objectCloud_ != NULL)
+			objectCloud_.reset();
+	}
+	
+	bool DataProcessor::processDataCallback (duplo_v0::Process_PCD::Request &req,
+										   duplo_v0::Process_PCD::Response &res)
+	{
+		//pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
+		input_ = pcl::PointCloud<pcl::PointXYZRGB>::Ptr (new pcl::PointCloud<pcl::PointXYZRGB>);
+		pcl::fromROSMsg(req.pcd_in,*input_);
+		
+		preprocess();
+		
+		/********************** Cluster objects based on Euclidean distance **********/
+		int numClustersFound = cluster();
+		if (numClustersFound == 0)
+			theChosenOne_.data.clear();
+		res.n_clusters = numClustersFound;
+		
+		if (theChosenOne_.data.size() != 0) {
+			noClusterCount_ = 0;
+			callGraspingService();
+		} else {
+			ROS_INFO("No cluster found. Retrying with new point cloud.");
+			noClusterCount_++;
+			if (noClusterCount_ == 3) {
+				ROS_INFO("The table has been cleared.");
+				ros::shutdown();
+			} else	callNewDataService();
+		}
+		return true;
+	}
+	
+	void DataProcessor::preprocess(void)
+	{
+		planarCloud_ = pcl::PointCloud<pcl::PointXYZRGB>::Ptr (new pcl::PointCloud<pcl::PointXYZRGB>);
+		objectCloud_ = pcl::PointCloud<pcl::PointXYZRGB>::Ptr (new pcl::PointCloud<pcl::PointXYZRGB>);
+		
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr pcdFiltered(new pcl::PointCloud<pcl::PointXYZRGB>);	//Filtered cloud
+		pcl::PointCloud<pcl::PointXYZRGB>::Ptr everythingElse(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+		sensor_msgs::PointCloud2 topub;
+		
+		/****************** Filter out the non-table points ******************/
+		pass_through_gen(input_,pcdFiltered,true,0,1.5,true,-0.9,0.4,true,0,1);
+				
+		/* ********* Segmentation of the cloud into table and object clouds **********/
+		planar_seg(pcdFiltered,planarCloud_,everythingElse,"table_try.pcd","everything_else.pcd");
+		toROSMsg(*planarCloud_, topub);
+		planarCloudPub_.publish(topub);
+		                        
+		/*********** Find dimensions of table **********/
+		std::vector<geometry_msgs::Point> extent = find_extents(*planarCloud_);
+		
+		/********** Now filter the object cloud based on table dimensions *********/
+		pass_through_gen(everythingElse,objectCloud_,true,extent[0].x, extent[1].x-0.05,
+						 true,extent[2].y+0.01,extent[3].y-0.005,true,extent[4].z,extent[4].z+0.2);
+
+		toROSMsg(*objectCloud_, topub);
+		objectCloudPub_.publish(topub);
+		
+		pcdFiltered.reset();
+		//delete everythingElse;
+	}
+	
+	int DataProcessor::cluster(void)
+	{
+		//PCDWriter writer;
+		
+		// Creating the KdTree object for the search method of the extraction
+		KdTree<pcl::PointXYZRGB>::Ptr tree (new pcl::KdTreeFLANN<pcl::PointXYZRGB>);
+		tree->setInputCloud (objectCloud_);
+		
+		std::vector<pcl::PointIndices> cluster_indices;
+		//pcl::initTree(0, tree);
+		
+		std::vector<int> temp;
+		for (size_t j = 0; j < objectCloud_->points.size(); ++j)
+			temp.push_back(j);
+		boost::shared_ptr<const std::vector<int> > indices (new std::vector<int> (temp)); 
+		
+		tree->setInputCloud (objectCloud_, indices);
+		extract_color_clusters(*objectCloud_, *indices, tree, 0.01, cluster_indices, 200, 1500);
+		
+		int j = 0;
+		
+		for (std::vector<pcl::PointIndices>::const_iterator it = cluster_indices.begin (); it != cluster_indices.end (); ++it)
+		{
+			pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_cluster (new pcl::PointCloud<pcl::PointXYZRGB>);
+			pcl::PointCloud<pcl::PointXYZRGB>::Ptr cluster_projected (new pcl::PointCloud<pcl::PointXYZRGB>);
+			
+			/*************** Separating out and saving each cluster ***************/
+			for (std::vector<int>::const_iterator pit = it->indices.begin (); pit != it->indices.end (); pit++)
+				cloud_cluster->points.push_back (objectCloud_->points[*pit]); //*
+			ROS_INFO("PointCloud representing the Cluster: %zu data points.", cloud_cluster->points.size ());
+			
+			//ROS_INFO("Frame id of cluster %d: %s",j,cluster_msg.header.frame_id.c_str());
+						
+			//stringstream ss;
+			//ss << "cluster_" << j << ".pcd";
+			//writer.write<PointXYZRGB> (ss.str (), *cloud_cluster, false); 
+			
+			if (j == 0) {
+				sensor_msgs::PointCloud2 cluster_msg;
+				toROSMsg(*cloud_cluster,cluster_msg);
+				theChosenOne_ = cluster_msg;
+			}
+						
+			j++;
+		}
+		return (j);
+	}
+	
+	bool DataProcessor::callGraspingService(void)
+	{
+		duplo_v0::Grasp_Duplo srvGrasp;
+		noClusterCount_ = 0;
+		srvGrasp.request.pick_cluster = theChosenOne_;
+		
+		if (graspDuploClient_.call(srvGrasp)) {
+			ROS_INFO("Called the grasping pipeline.");
+			return true;
+		} else {
+			ROS_ERROR("Failed to call service grasp duplo.");
+			return false;
+		}
+	}
+	
+	bool DataProcessor::callNewDataService(void)
+	{
+		// Ask for new Kinect data
+		duplo_v0::Get_New_PCD srvNewData;
+		ros::Duration(2).sleep();
+		srvNewData.request.question = true;
+		
+		if (getNewDataClient_.call(srvNewData)) {
+			ROS_INFO("Requesting for new point cloud.");
+			return true;
+		} else {
+			ROS_ERROR("Failed to call service get new pcd.");
+			return false;
+		}
+	}		
+}
+
+int main (int argc, char** argv)
+{
+	ros::init(argc, argv, "process_data");
+	ros::NodeHandle n;
+	sort_duplos::DataProcessor data_processor(n);
+	ros::spin();
+	return 0;
+}
+

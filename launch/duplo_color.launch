@@ -1,0 +1,8 @@
+<launch>
+
+	<!-- Start Duplo sorting nodes -->
+	<node name="process_data" pkg="duplo_v0" type="process_data" respawn="false" output="screen" />
+	<node name="grasp_duplo_server" pkg="duplo_v0" type="grasp_duplo" respawn="false" output="screen" />
+	<node name="pcd_from_kinect" pkg="duplo_v0" type="read_pcd" output="screen"/>
+	
+</launch>

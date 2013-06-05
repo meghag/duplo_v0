@@ -1,0 +1,38 @@
+
+ros::Publisher pub;
+sensor_msgs::PointCloud2 to_pick;
+//bool grasp_service_called = false;
+
+bool grasp_and_bin(duplo_v0::Grasp_Duplo::Request &req,
+                   duplo_v0::Grasp_Duplo::Response &res)
+{
+  ROS_INFO("Publishing the point cloud to be picked up.");
+  pub.publish(req.pick_cluster);  
+  return true;
+}
+
+int main(int argc, char **argv)
+{
+	//initialize the ROS node
+	ros::init(argc, argv, "grasp_duplo");
+	ros::NodeHandle n;
+	DuploGrasper grasper(n);
+	ros::spin();
+	return 0;
+}
+
+namespace sort_duplos{
+	DuploGrasper::DuploGrasper (ros::NodeHandle & n): n_(n)
+	{
+  		ROS_INFO("Starting grasp duplo node.");
+		targetObjectPub_ = n.advertise<sensor_msgs::PointCloud2>("target_object",1);
+		graspDuploServer_ = n.advertiseService("grasp_duplo", &DuploGrasper::graspDuploCallback, this);
+	}
+
+	DuploGrasper::~DuploGrasper (void)
+	{
+	}
+
+	bool DuploGrasper::graspDuploCallback (duplo_v0::Grasp_Duplo::Request &req
+  
+}
